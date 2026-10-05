@@ -1,0 +1,22 @@
+/var/*
+!/var/.gitkeep
+/.env
+/node_modules/
+/.DS_Store
+/tests/__pycache__/
+/scripts/__pycache__/
+
+# Local connection data, credentials, editor state, and exports
+/.env.*
+/.idea/
+/.vscode/
+/secrets/
+/private/
+/backups/
+/exports/
+*.pem
+*.key
+*.p12
+*.pfx
+*.conf
+known_hosts*

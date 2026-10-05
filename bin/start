@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+command -v php >/dev/null 2>&1 || { echo 'Требуется PHP 8.2+'; exit 1; }
+php -r 'exit(PHP_VERSION_ID >= 80200 && extension_loaded("sodium") && extension_loaded("mbstring") ? 0 : 1);' || { echo 'Требуется PHP 8.2+ с расширениями sodium и mbstring'; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo 'Требуется Python 3.10+'; exit 1; }
+command -v ssh >/dev/null 2>&1 || { echo 'Требуется OpenSSH'; exit 1; }
+command -v ssh-keyscan >/dev/null 2>&1 || { echo 'Требуется OpenSSH ssh-keyscan'; exit 1; }
+echo 'AWG Control → http://127.0.0.1:8787'
+exec php -S 127.0.0.1:8787 -t public public/router.php
