@@ -1,4 +1,5 @@
 import { createGrid } from './vendor/grid.js';
+import { connectionQrSvg } from './connection-qr.js';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -216,8 +217,20 @@ async function executePlan(data,confirmation){
   try{
     const result=await api('actions/execute',{method:'POST',body:{plan_id:data.plan_id,confirmation}});
     const config=result.config;
-    modal(executionMode==='demo'?'Операция симулирована':'Операция завершена','',`<div class="plan-summary">${escape(result.message||result.summary||'Команда обработана. Обновляем состояние сервера.')}</div>${result.output?`<pre class="code-block">${escape(result.output)}</pre>`:''}${config?`${notice('Сохраните конфигурацию сейчас. Приватный ключ выдается один раз и не будет доступен после закрытия этого окна.')}<pre class="code-block" id="new-client-config">${escape(config)}</pre>`:''}`,`${config?`<button class="button" id="new-config-copy">${icon('copy')} Скопировать</button><button class="button button-primary" id="new-config-download">${icon('download')} Скачать .conf</button>`:''}<button class="button" data-close>${icon('check')} Готово</button>`);
-    if(config){$('#new-config-copy').addEventListener('click',()=>copy(config));$('#new-config-download').addEventListener('click',()=>download(result.filename||'awg-client.conf',config,'text/plain;charset=utf-8'));}
+    let qrSvg='',qrError='';
+    if(config){
+      try{qrSvg=connectionQrSvg(config);}
+      catch(e){qrError=notice(e instanceof RangeError?e.message:'Не удалось сформировать QR-код. Скачайте конфигурацию .conf.','error');}
+    }
+    const connection=config?`${notice('Сохраните конфигурацию сейчас. Файл и QR-код содержат приватный ключ подключения и доступны только до закрытия этого окна.')}${qrSvg?`<section class="connection-qr" aria-labelledby="connection-qr-title"><h3 id="connection-qr-title">Подключение по QR-коду</h3><div class="connection-qr-image" role="img" aria-label="QR-код подключения AmneziaWG">${qrSvg}</div><p class="small-note">В приложении AmneziaWG нажмите + → Сканировать QR-код. Версия клиента должна поддерживать параметры вашего туннеля.</p></section>`:qrError}<div class="subsection-title">КОНФИГУРАЦИЯ ПОДКЛЮЧЕНИЯ</div><pre class="code-block" id="new-client-config">${escape(config)}</pre>`:'';
+    const exports=config?`<button class="button" id="new-config-copy">${icon('copy')} Скопировать</button>${qrSvg?`<button class="button" id="new-qr-download">${icon('download')} Скачать QR</button>`:''}<button class="button button-primary" id="new-config-download">${icon('download')} Скачать .conf</button>`:'';
+    modal(executionMode==='demo'?'Операция симулирована':'Операция завершена','',`<div class="plan-summary">${escape(result.message||result.summary||'Команда обработана. Обновляем состояние сервера.')}</div>${result.output?`<pre class="code-block">${escape(result.output)}</pre>`:''}${connection}`,`${exports}<button class="button" data-close>${icon('check')} Готово</button>`);
+    if(config){
+      const filename=result.filename||'awg-client.conf';
+      $('#new-config-copy').addEventListener('click',()=>copy(config));
+      $('#new-config-download').addEventListener('click',()=>download(filename,config,'text/plain;charset=utf-8'));
+      if(qrSvg)$('#new-qr-download').addEventListener('click',()=>download(filename.replace(/\.conf$/i,'')+'.svg',qrSvg,'image/svg+xml;charset=utf-8'));
+    }
     refresh(true);loadAudit(false);
   }catch(e){toast(e.message,true);if(button){button.disabled=true;button.textContent='План использован — подготовьте новый';}}
 }
