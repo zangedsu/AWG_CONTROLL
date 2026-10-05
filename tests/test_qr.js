@@ -6,6 +6,7 @@ const { createHash } = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { deflateSync, inflateSync } = require('node:zlib');
 
 // Exercise the same ordinary-script form shipped in app.bundle.js, including
 // on Node 18 which does not infer ES modules for .js files without package.json.
@@ -15,8 +16,8 @@ const source = ['vendor/qrcodegen.js', 'connection-qr.js'].map(file =>
     .replace(/^export \{[^\n]+\n/gm, '')
     .replace(/^export /gm, '')
     .replace(/[ \t]+$/gm, '')).join('\n');
-const connectionQrSvg = new vm.Script(
-  "(() => { 'use strict';\n" + source + '\nreturn connectionQrSvg;\n})();',
+const { connectionQrSvg, amneziaQrSvg } = new vm.Script(
+  "(() => { 'use strict';\n" + source + '\nreturn { connectionQrSvg, amneziaQrSvg };\n})();',
   { filename: 'connection-qr.test.bundle.js' }).runInThisContext();
 
 const config = `[Interface]
@@ -54,6 +55,37 @@ const fixtures = [
   ['LOW fallback', fallbackConfig],
   ['maximum byte payload', maximumConfig],
 ];
+
+// Independently frame the official Qt wire format: qCompress bytes, split into
+// 850-byte chunks; qint16 magic, quint8 total/index and a QByteArray length prefix.
+function amneziaPackets(profile) {
+  const json = Buffer.from(JSON.stringify(profile));
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(json.length);
+  const compressed = Buffer.concat([length, deflateSync(json, { level: 8 })]);
+  const total = Math.ceil(compressed.length / 850);
+  const packets = [];
+  for (let index = 0; index < total; index++) {
+    const chunk = compressed.subarray(index * 850, (index + 1) * 850);
+    const header = Buffer.alloc(8);
+    header.writeInt16BE(1984);
+    header.writeUInt8(total, 2);
+    header.writeUInt8(index, 3);
+    header.writeUInt32BE(chunk.length, 4);
+    packets.push(Buffer.concat([header, chunk]).toString('base64url'));
+  }
+  return packets;
+}
+
+const amneziaProfiles = [
+  ['single Qt packet', { description: 'Рабочий ноутбук — 東京 🔐', containers: [] }],
+  ['multiple Qt packets', {
+    description: 'Large profile',
+    // Deterministic data with enough entropy to exercise full 850-byte chunks.
+    data: Array.from({ length: 100 }, (_, index) => createHash('sha256').update(`test ${index}`).digest('hex')).join(''),
+  }],
+];
+const amneziaFixtures = amneziaProfiles.map(([name, profile]) => [name, profile, amneziaPackets(profile)]);
 
 // Parse only the deliberately small SVG grammar returned by this feature. This
 // also verifies that no text, scripts, external references or key metadata leaks.
@@ -126,6 +158,30 @@ test('verified AWG and Unicode image fixtures remain unchanged', () => {
   }
 });
 
+for (const [name, , packets] of amneziaFixtures) {
+  test(`AmneziaVPN QR preserves Qt packet and LOW geometry: ${name}`, () => {
+    assert.equal(packets.length === 1, name === 'single Qt packet');
+    for (const payload of packets) {
+      assert.ok(payload.length <= 1144);
+      const svg = amneziaQrSvg(payload);
+      const image = imageFromSvg(svg);
+      assert.equal(image.ecc, 1, 'LOW exactly; automatic ECC boosting is disabled');
+      assert.equal(svg, amneziaQrSvg(payload), 'deterministic local encoding');
+    }
+  });
+}
+
+test('AmneziaVPN QR validates bounded base64url input', () => {
+  for (const payload of [null, undefined, 10, {}, '', 'vpn://test', 'a+b', 'a/b', 'abc=', 'test\n', '<svg>']) {
+    assert.throws(() => amneziaQrSvg(payload), TypeError);
+  }
+  for (const payload of ['x'.repeat(1145), 'x'.repeat(1000000)]) {
+    assert.throws(() => amneziaQrSvg(payload), error => error instanceof RangeError && /\.vpn/.test(error.message));
+  }
+  assert.doesNotThrow(() => amneziaQrSvg('x'.repeat(1144)));
+  assert.equal(imageFromSvg(amneziaQrSvg('AAAA')).ecc, 1, 'even small packets keep LOW');
+});
+
 test('independent decoder recovers the entire configuration byte for byte', { skip: !process.env.AWG_TEST_QR_DECODER && 'Set AWG_TEST_QR_DECODER to run optional jsQR round trips' }, () => {
   const jsQR = require(process.env.AWG_TEST_QR_DECODER);
   for (const [name, payload] of fixtures) {
@@ -134,5 +190,32 @@ test('independent decoder recovers the entire configuration byte for byte', { sk
     assert.ok(decoded, `${name} should decode from rendered geometry`);
     assert.equal(decoded.data, payload, name);
     assert.deepEqual(Buffer.from(decoded.binaryData), Buffer.from(payload, 'utf8'), name);
+  }
+});
+
+test('independent decoder recovers and reassembles single and multipart Qt packets', { skip: !process.env.AWG_TEST_QR_DECODER && 'Set AWG_TEST_QR_DECODER to run optional jsQR round trips' }, () => {
+  const jsQR = require(process.env.AWG_TEST_QR_DECODER);
+  for (const [name, profile, packets] of amneziaFixtures) {
+    const chunks = [];
+    for (let index = 0; index < packets.length; index++) {
+      const payload = packets[index];
+      const image = imageFromSvg(amneziaQrSvg(payload));
+      const decoded = jsQR(image.rgba, image.width, image.width, { inversionAttempts: 'dontInvert' });
+      assert.ok(decoded, `${name} ${index} should decode from rendered geometry`);
+      assert.equal(decoded.data, payload, 'base64url envelope is unchanged');
+      assert.deepEqual(Buffer.from(decoded.binaryData), Buffer.from(payload, 'utf8'));
+      const packet = Buffer.from(decoded.data, 'base64url');
+      assert.equal(packet.readInt16BE(0), 1984);
+      assert.equal(packet.readUInt8(2), packets.length);
+      assert.equal(packet.readUInt8(3), index);
+      const chunk = packet.subarray(8);
+      assert.equal(packet.readUInt32BE(4), chunk.length);
+      assert.ok(chunk.length <= 850);
+      chunks.push(chunk);
+    }
+    const compressed = Buffer.concat(chunks);
+    const json = inflateSync(compressed.subarray(4));
+    assert.equal(compressed.readUInt32BE(0), json.length, 'qCompress preserves UTF-8 length');
+    assert.deepEqual(JSON.parse(json.toString('utf8')), profile, name);
   }
 });

@@ -6,6 +6,8 @@
 
 Официальные гостевые подключения имеют два разных формата: `vpn://` для AmneziaVPN и `.conf` в нативном формате AmneziaWG. Нативный файл работает только с клиентом, поддерживающим соответствующую версию протокола. Для разных устройств выдавайте отдельные подключения. [Выдача и отзыв доступа](https://docs.amnezia.org/documentation/instructions/share-connection/), [нативный клиент](https://docs.amnezia.org/documentation/instructions/use-amneziawg-app/).
 
+Панель выдаёт оба формата в окне результата создания клиента. Экспорт AmneziaVPN содержит гостевой профиль с параметрами туннеля; SSH-пароль, имя SSH-пользователя и локальный путь к ключу в него не входят. `vpn://` и файл `.vpn` содержат Base64URL от `qCompress`-совместимого JSON: четыре байта длины UTF-8 JSON в big-endian, затем zlib. QR AmneziaVPN кодирует отдельные пакеты с заголовком Qt (`magic=1984`, число частей, индекс, длина блока) и блоками до 850 байт. Поэтому QR ключа `vpn://` и обычный QR текста `.conf` не заменяют этот формат. При нескольких частях нужно отсканировать всю серию. Нативный QR содержит исходный текст `.conf`. Реализация сверена с [экспортёром AmneziaVPN 5.0.3.0](https://github.com/amnezia-vpn/amnezia-client/blob/5.0.3.0/client/core/controllers/selfhosted/exportController.cpp) и [Qt-пакетами QR](https://github.com/amnezia-vpn/amnezia-client/blob/5.0.3.0/client/core/utils/qrCodeUtils.cpp).
+
 | Обнаруженная конфигурация | Типичная схема официального контейнера | Как работать |
 | --- | --- | --- |
 | AWG Legacy | `amnezia-awg`, `wg`, `wg0`, `/opt/amnezia/awg/wg0.conf` | Сохранять существующие параметры; не переводить автоматически в новую версию. |

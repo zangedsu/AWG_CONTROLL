@@ -210,7 +210,7 @@ def ssh_call(server, operation, params):
 # secrets exist only in that process and are stripped before snapshot output.
 REMOTE_SCRIPT = r'''
 import base64, collections, concurrent.futures, datetime, fcntl, glob, gzip, hashlib, ipaddress
-import json, os, platform, re, selectors, shutil, signal, socket, stat, subprocess, tempfile, time
+import json, os, platform, re, selectors, shutil, signal, socket, stat, struct, subprocess, tempfile, time, zlib
 
 WARNINGS = []
 CONFIG_PATHS = ['/opt/amnezia/awg/awg0.conf', '/opt/amnezia/awg/wg0.conf',
@@ -392,6 +392,86 @@ def client_keepalive(params,config):
     if len(parts)==2 and not awg3:
         raise RemoteError('Persistent keepalive ranges require AmneziaWG 3.1 configuration markers.')
     return '-'.join(str(part) for part in parts)
+
+def amnezia_qr_payloads(data):
+    # qrCodeUtils::generateQrCodeImageSeries writes this QDataStream envelope,
+    # including the QByteArray length, around each 850-byte qCompress chunk.
+    # The QR contains the binary envelope as base64url, without a vpn:// prefix.
+    count=(len(data)+849)//850
+    if not 1<=count<=255:raise RemoteError('AmneziaVPN QR export exceeds the 255-part format limit.')
+    return [base64.urlsafe_b64encode(struct.pack('>hBBI',1984,count,index,len(chunk))+chunk).decode().rstrip('=')
+            for index in range(count) for chunk in [data[index*850:(index+1)*850]]]
+
+def amnezia_client_export(native,name,public,host,container,tool,server_config):
+    # Match ExportController::generateConnectionConfig and the self-hosted user
+    # models in amnezia-vpn/amnezia-client (5.0.3.0 and dev). The guest document
+    # has no SSH credentials; only the newly created client's keys are included.
+    # last_config is a JSON *string*, protocol.port a string, client.port an int.
+    try:host_address=ipaddress.ip_address(host)
+    except ValueError:host_address=None
+    # Stable Amnezia guest drivers concatenate hostName + ':' + port without
+    # IPv6 brackets. Preserve the valid native endpoint instead of exporting a
+    # guest that imports successfully but cannot connect to a literal IPv6 host.
+    if host_address is not None and host_address.version==6:
+        raise RemoteError('AmneziaVPN guest export requires an IPv4 endpoint or DNS hostname, not a literal IPv6 host.')
+    interface,peers=parse_config(native)
+    if tool not in ('wg','awg') or len(peers)!=1:raise RemoteError('Unsupported protocol for AmneziaVPN export.')
+    peer=peers[0];version=infer_protocol_version(interface)
+    awg=version!='WireGuard'
+    if awg:
+        default_container=container if container in ('amnezia-awg','amnezia-awg2') else (
+            'amnezia-awg' if version=='1.0' else 'amnezia-awg2')
+        protocol='awg'
+    else:
+        default_container='amnezia-wireguard';protocol='wireguard'
+    validate_key(public);validate_key(interface.get('PrivateKey'));validate_key(peer.get('PublicKey'))
+    if peer.get('PresharedKey'):validate_key(peer['PresharedKey'])
+    port=intvalue(server_config.get('ListenPort'))
+    if not 1<=port<=65535:raise RemoteError('Invalid tunnel port for AmneziaVPN export.')
+    addresses=[ipaddress.ip_interface(value.strip()) for value in interface.get('Address','').split(',') if value.strip()]
+    dns=[str(ipaddress.ip_address(value.strip())) for value in interface.get('DNS','').split(',') if value.strip()]
+    allowed=[value.strip() for value in peer.get('AllowedIPs','').split(',') if value.strip()]
+    if not addresses or not dns or not allowed:raise RemoteError('Incomplete client metadata for AmneziaVPN export.')
+    for value in allowed:ipaddress.ip_network(value,strict=False)
+    primary=next((value for value in addresses if value.version==4),None)
+    if primary is None:raise RemoteError('AmneziaVPN guest export requires a primary IPv4 client address.')
+    # SelfHostedUserServerConfig::getDnsPair validates only IPv4 DNS metadata.
+    # Keep IPv6 DNS in the exact native config, never silently replace it here.
+    ipv4_dns=[value for value in dns if ipaddress.ip_address(value).version==4]
+    if not ipv4_dns:raise RemoteError('AmneziaVPN guest export requires at least one IPv4 DNS server.')
+    # Match the official guest generator's bare IPv4 metadata. Desktop Amnezia
+    # drivers expect one address here; raw .conf still retains all IPv4/IPv6.
+    client={'config':native,'hostName':host,'port':port,'client_ip':str(primary.ip),
+            'client_priv_key':interface['PrivateKey'],'client_pub_key':public,
+            'server_pub_key':peer['PublicKey'],'clientId':public,'allowed_ips':allowed,
+            'persistent_keep_alive':peer.get('PersistentKeepalive','')}
+    if peer.get('PresharedKey'):client['psk_key']=peer['PresharedKey']
+    if interface.get('MTU'):client['mtu']=interface['MTU']
+    settings={'port':str(port),'transport_proto':'udp'}
+    if awg:
+        # Official AWG metadata names version 2 "2", not the UI label "2.0".
+        if version!='1.0':settings['protocol_version']='2' if version=='2.0' else version
+        for key in AWG_PARAMETERS:
+            if interface.get(key):client[key]=interface[key];settings[key]=interface[key]
+    server_addresses=[ipaddress.ip_interface(value.strip()) for value in server_config.get('Address','').split(',') if value.strip()]
+    ipv4=next((value for value in server_addresses if value.version==4),None)
+    if ipv4:
+        settings.update(subnet_address=str(ipv4.network.network_address),subnet_cidr=str(ipv4.network.prefixlen))
+        if not awg:settings['subnet_mask']=str(ipv4.network.netmask)
+    settings['last_config']=json.dumps(client,ensure_ascii=False,separators=(',',':'))
+    guest={'format_version':1,'description':name,'hostName':host,'defaultContainer':default_container,
+           'dns1':ipv4_dns[0],'dns2':ipv4_dns[1] if len(ipv4_dns)>1 else ipv4_dns[0],
+           'containers':[{'container':default_container,protocol:settings}]}
+    raw=json.dumps(guest,ensure_ascii=False,separators=(',',':')).encode('utf-8')
+    if len(raw)>4*1024*1024:raise RemoteError('AmneziaVPN configuration exceeds the safe export limit.')
+    # qCompress prepends the uncompressed byte count in big endian to zlib data.
+    compressed=struct.pack('>I',len(raw))+zlib.compress(raw,8)
+    exported={'key':'vpn://'+base64.urlsafe_b64encode(compressed).decode().rstrip('='),
+              'qr_payloads':amnezia_qr_payloads(compressed),
+              'filename':re.sub(r'[^A-Za-z0-9_.-]','_',name)[:64]+'.vpn'}
+    if any(value.version==6 for value in addresses) or any(ipaddress.ip_address(value).version==6 for value in dns):
+        exported['warning']='Экспорт AmneziaVPN использует основной IPv4-адрес и IPv4 DNS. Для подключения с указанными IPv6-адресами и DNS выберите нативный .conf в совместимом клиенте.'
+    return exported
 
 def table_names(table):
     names = {}
@@ -838,7 +918,7 @@ def plan_action(params):
                   'Create timestamped backups with mode 0600.',
                   'Write configuration atomically, synchronize '+tool+' without tunnel restart.',
                   'Restore backups on failure.']
-        warnings=['Для нового клиента приватный ключ выдаётся один раз в .conf. Приватные ключи существующих клиентов восстановить нельзя.']
+        warnings=['Ключи подключения и конфигурация выдаются один раз после создания клиента. Приватные ключи существующих клиентов восстановить нельзя.']
     elif action.startswith('container.'):
         target=str(params.get('container') or '');validate_container(target)
         info=json_value(require(run(['docker','inspect',target]),'Inspect container'),[])
@@ -917,7 +997,8 @@ def mutate_client(params):
     table=json_value(tabletext,[])
     if tabletext and not isinstance(table,list): raise RemoteError('Unsupported clientsTable format; no changes made.')
     if tabletext and not isinstance(json_value(tabletext,None),list): raise RemoteError('Invalid clientsTable JSON; no changes made.')
-    export=None;public=params.get('public_key');address=None;ipv6_address=None
+    export=None;amnezia=None;amnezia_error=None;version=None
+    public=params.get('public_key');address=None;ipv6_address=None
     if action=='client.create':
         keepalive=client_keepalive(params,config)
         addresses=[v.strip() for v in config.get('Address','').split(',') if v.strip()]
@@ -968,6 +1049,14 @@ def mutate_client(params):
             value=export_parameters.get(key)
             if value: export+=key+' = '+value+'\n'
         export+='\n[Peer]\nPublicKey = '+serverpub+'\nPresharedKey = '+psk+'\nAllowedIPs = '+allowed+'\nEndpoint = '+endpoint+':'+str(port)+'\nPersistentKeepalive = '+keepalive+'\n'
+        version=infer_protocol_version(export_parameters)
+        # Prepare both exports before any persistent or runtime server writes.
+        # An unsupported Amnezia metadata/QR size leaves the native .conf usable.
+        try:amnezia=amnezia_client_export(export,name,public,str(REQUEST['host']),container,tool,config)
+        except (RemoteError,ValueError,TypeError,OverflowError):
+            amnezia_error=('Экспорт AmneziaVPN недоступен для сервера с IPv6-адресом. Используйте нативный .conf.'
+                           if ':' in str(REQUEST['host']) else
+                           'Экспорт для AmneziaVPN недоступен для этой конфигурации. Используйте нативный .conf.')
         text=text.rstrip()+'\n\n[Peer]\nPublicKey = '+public+'\nPresharedKey = '+psk+'\nAllowedIPs = '+client_addresses+'\n'
         table.append({'clientId':public,'userData':{'clientName':name,'creationDate':datetime.datetime.now(datetime.timezone.utc).isoformat()},'clientIp':address})
     elif action=='client.delete':
@@ -996,9 +1085,12 @@ def mutate_client(params):
         if tablebackup: write_atomic(container,tablepath,context_read(container,tablebackup),token+'-rollback')
         if action!='client.rename': synchronize(container,iface,path,tool)
         raise
-    return {'action':action,'public_key':public,'address':address,'ipv6_address':ipv6_address,'name':name,'backup':backup,
+    result={'action':action,'public_key':public,'address':address,'ipv6_address':ipv6_address,'name':name,'backup':backup,
             'config':export,'filename':re.sub(r'[^A-Za-z0-9_.-]','_',name)[:64]+'.conf' if export else None,
             'message':'Изменение применено.','completed_at':now()}
+    if export:result.update(amnezia=amnezia,amnezia_error=amnezia_error,
+                            protocol='WireGuard' if version=='WireGuard' else 'AmneziaWG',protocol_version=version)
+    return result
 
 def update_compose_container(params):
     name=params['container'];validate_container(name)

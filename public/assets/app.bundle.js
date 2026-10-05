@@ -1560,6 +1560,7 @@ var qrcodegen;
 
 
 const QR_TOO_LARGE = 'Конфигурация слишком большая для QR-кода. Скачайте файл .conf.';
+const AMNEZIA_QR_TOO_LARGE = 'Данные слишком большие для QR-кода AmneziaVPN. Скачайте файл .vpn.';
 
 // Encode the exact downloaded configuration locally. The SVG contains geometry
 // only; configuration text and private keys must never become SVG attributes.
@@ -1580,6 +1581,21 @@ function connectionQrSvg(config) {
       throw new RangeError(QR_TOO_LARGE);
     }
   }
+  return qrSvg(qr);
+}
+
+// AmneziaVPN reads base64url-encoded Qt packets, one per QR, with LOW error
+// correction. The server bounds each packet to its 8-byte header + 850-byte chunk.
+function amneziaQrSvg(payload) {
+  if (typeof payload !== 'string') throw new TypeError('Данные QR-кода должны быть строкой.');
+  if (payload.length > 1144) throw new RangeError(AMNEZIA_QR_TOO_LARGE);
+  if (!/^[A-Za-z0-9_-]+$/.test(payload)) throw new TypeError('Некорректные данные QR-кода AmneziaVPN.');
+  const qr = qrcodegen.QrCode.encodeSegments(
+    qrcodegen.QrSegment.makeSegments(payload), qrcodegen.QrCode.Ecc.LOW, 1, 40, -1, false);
+  return qrSvg(qr);
+}
+
+function qrSvg(qr) {
   const border = 4;
   const size = qr.size + border * 2;
   const paths = [];
@@ -1802,26 +1818,53 @@ function showService(name){const s=services().find(s=>s.name===name);if(!s)retur
 function containerLogs(name){const source=sourceList().find(s=>s.container===name||s.id===`docker:${name}`||s.label===name||s.id===name);if(!source){toast('Источник логов этого контейнера не обнаружен',true);return;}state.logSource=source.id;state.logs=null;location.hash='logs';if(state.view==='logs'){render();loadLogs();}}
 async function showConfig(container,iface){const modalGeneration=loadingModal('Конфигурация AmneziaWG'),generation=state.generation;try{const data=await api(`config?${query({container,interface:iface})}`);if(generation!==state.generation||modalGeneration!==state.modalGeneration||!$('#modal').open)return;modal('Конфигурация AmneziaWG',`${container} / ${iface} · секреты скрыты`,`${data.version?`<div class="pill pill-neutral" style="margin-bottom:13px">${escape(data.version)}</div>`:''}<pre class="code-block">${escape(data.config_redacted||data.config||data.text||formatRaw(data.parameters)||'Конфигурация недоступна')}</pre><p class="small-note">Приватные ключи, PSK и секреты исключены. Отображаемая конфигурация предназначена для диагностики.</p>`,`<button class="button" data-close>Закрыть</button><button class="button" id="config-download">${icon('download')} Скачать</button>`);$('#config-download').addEventListener('click',()=>download(`${container}-${iface}-redacted.conf`,data.config_redacted||data.config||data.text||formatRaw(data.parameters),'text/plain'));}catch(e){if(generation!==state.generation||modalGeneration!==state.modalGeneration||!$('#modal').open)return;modal('Конфигурация недоступна','',notice(e.message,'error'),'<button class="button" data-close>Закрыть</button>');}}
 async function plan(action,target,params={}){const modalGeneration=loadingModal('Подготовка операции'),generation=state.generation,planServer=selectedServer();try{const data=await api('actions/plan',{method:'POST',body:{server_id:state.server,mode:state.mode,action,target,params}});if(generation!==state.generation||modalGeneration!==state.modalGeneration||!$('#modal').open)return;state.pendingPlan=data;const commands=Array.isArray(data.commands)?data.commands.map(c=>typeof c==='string'?c:c.command||JSON.stringify(c)).join('\n'):data.commands||'';const warnings=(data.warnings||[]).map(w=>notice(typeof w==='string'?w:w.message||JSON.stringify(w),'error')).join('');const canExecute=data.executable&&!data.read_only;modal('План операции',`${planServer.host} · ${action} · ${target}`,`<div class="plan-summary">${escape(data.summary||'Проверьте команды и результат перед выполнением.')}</div>${warnings}${!canExecute?notice('Выполнение недоступно: это защищенное подключение или операция поддерживает только просмотр плана.'):state.mode==='demo'?notice('Операция будет симулирована в демонстрационном режиме. Реальный сервер не изменяется.'):notice('Действие изменит выбранный сервер. Проверьте цель и команды.','error')}<div class="subsection-title">КОМАНДЫ ОПЕРАЦИИ</div><pre class="code-block plan-command">${escape(commands||'Команды не требуются для этой операции.')}</pre>${canExecute?`<div class="form-field" style="margin-top:18px"><label for="action-confirmation">Для подтверждения введите: ${escape(target)}</label><input id="action-confirmation" placeholder="${attr(target)}" autocomplete="off"></div>`:''}`,`<button class="button" data-close>Закрыть</button><button class="button" id="plan-download">${icon('download')} Скачать план</button>${canExecute?`<button class="button button-danger" id="plan-execute" disabled>${icon('power')} ${state.mode==='demo'?'Симулировать':'Выполнить'}</button>`:`<button class="button" disabled>${icon('lock')} Выполнение заблокировано</button>`}`);$('#plan-download').addEventListener('click',()=>download(`awg-plan-${action}.json`,JSON.stringify(data,null,2)));if(canExecute){const confirmation=$('#action-confirmation'),button=$('#plan-execute');confirmation.addEventListener('input',()=>{button.disabled=confirmation.value!==String(target);});button.addEventListener('click',()=>executePlan(data,confirmation.value));}loadAudit(false);}catch(e){if(generation!==state.generation||modalGeneration!==state.modalGeneration||!$('#modal').open)return;modal('Не удалось подготовить операцию','',notice(e.message,'error'),'<button class="button" data-close>Закрыть</button>');}}
+function showOperationResult(result,executionMode){
+  const config=result.config;
+  const amnezia=result.amnezia;
+  const hasAmnezia=Boolean(config&&typeof amnezia?.key==='string'&&/^vpn:\/\/[A-Za-z0-9_-]+$/.test(amnezia.key)&&Array.isArray(amnezia.qr_payloads)&&amnezia.qr_payloads.length>0&&amnezia.qr_payloads.length<=255&&amnezia.qr_payloads.every(p=>typeof p==='string'&&p.length<=1144&&/^[A-Za-z0-9_-]+$/.test(p)));
+  const nativeApp=result.protocol==='WireGuard'?'WireGuard':'AmneziaWG';
+  const formatSelector=config?`${notice('Сохраните подключение сейчас. Ключ, конфигурация и QR-коды содержат приватный ключ и доступны только до закрытия этого окна.')}<div class="form-field"><label for="connection-format">Формат подключения</label><select id="connection-format"><option value="amnezia" ${hasAmnezia?'selected':'disabled'}>Для приложения AmneziaVPN</option><option value="native" ${hasAmnezia?'':'selected'}>Для других клиентов · .conf</option></select></div>${!hasAmnezia?notice(result.amnezia_error||'Экспорт для AmneziaVPN недоступен. Сохраните нативную конфигурацию .conf.'):''}<div id="connection-export-content"></div>`:'';
+  const footer=config?`<button class="button" id="new-config-copy">${icon('copy')} Скопировать</button><button class="button" id="new-qr-download">${icon('download')} Скачать QR</button><button class="button button-primary" id="new-config-download"></button>`:'';
+  modal(executionMode==='demo'?'Операция симулирована':'Операция завершена','',`<div class="plan-summary">${escape(result.message||result.summary||'Команда обработана. Обновляем состояние сервера.')}</div>${result.output?`<pre class="code-block">${escape(result.output)}</pre>`:''}${formatSelector}`,`${footer}<button class="button" data-close>${icon('check')} Готово</button>`);
+  if(!config)return;
+  let qrIndex=0,currentText='',currentFilename='',currentQr='';
+  const filename=result.filename||'awg-client.conf';
+  const stem=filename.replace(/\.conf$/i,'');
+  const renderExport=()=>{
+    const forAmnezia=$('#connection-format').value==='amnezia';
+    const qrCount=forAmnezia?amnezia.qr_payloads.length:1;
+    currentText=forAmnezia?amnezia.key:config;
+    currentFilename=forAmnezia?(amnezia.filename||stem+'.vpn'):filename;
+    currentQr='';let qrError='';
+    try{currentQr=forAmnezia?amneziaQrSvg(amnezia.qr_payloads[qrIndex]):connectionQrSvg(config);}
+    catch(e){qrError=notice(e instanceof RangeError?e.message:'Не удалось сформировать QR-код. Сохраните подключение через копирование или файл.','error');}
+    const paging=qrCount>1?`<div class="connection-qr-paging"><button class="button button-small" id="connection-qr-prev" aria-label="Предыдущий QR-код" ${qrIndex===0?'disabled':''}>←</button><span role="status" aria-live="polite">QR-код ${qrIndex+1} из ${qrCount}</span><button class="button button-small" id="connection-qr-next" aria-label="Следующий QR-код" ${qrIndex===qrCount-1?'disabled':''}>→</button></div>`:'';
+    const help=forAmnezia?`В AmneziaVPN нажмите + → QR-код.${qrCount>1?' Отсканируйте все QR-коды этого подключения ('+qrCount+'), переключая их стрелками.':''}`:`В приложении ${nativeApp} выберите добавление туннеля → Сканировать QR-код. Версия клиента должна поддерживать параметры вашего туннеля.`;
+    $('#connection-export-content').innerHTML=`${forAmnezia&&amnezia.warning?notice(amnezia.warning):''}${currentQr?`<section class="connection-qr" aria-labelledby="connection-qr-title"><h3 id="connection-qr-title">Подключение по QR-коду · ${forAmnezia?'AmneziaVPN':nativeApp}</h3><div class="connection-qr-image" role="img" aria-label="QR-код подключения ${forAmnezia?'AmneziaVPN':nativeApp}">${currentQr}</div>${paging}<p class="small-note">${escape(help)}</p></section>`:qrError}<div class="subsection-title">${forAmnezia?'КЛЮЧ ПОДКЛЮЧЕНИЯ AMNEZIAVPN':'КОНФИГУРАЦИЯ ПОДКЛЮЧЕНИЯ'}</div><pre class="code-block" id="new-client-config">${escape(currentText)}</pre>`;
+    $('#new-config-copy').innerHTML=`${icon('copy')} ${forAmnezia?'Скопировать ключ':'Скопировать конфиг'}`;
+    $('#new-config-download').innerHTML=`${icon('download')} Скачать ${forAmnezia?'.vpn':'.conf'}`;
+    $('#new-qr-download').hidden=!currentQr;
+    if(qrCount>1){
+      $('#connection-qr-prev')?.addEventListener('click',()=>{qrIndex--;renderExport();});
+      $('#connection-qr-next')?.addEventListener('click',()=>{qrIndex++;renderExport();});
+    }
+  };
+  $('#connection-format').addEventListener('change',()=>{qrIndex=0;renderExport();});
+  $('#new-config-copy').addEventListener('click',()=>copy(currentText));
+  $('#new-config-download').addEventListener('click',()=>download(currentFilename,currentText,'text/plain;charset=utf-8'));
+  $('#new-qr-download').addEventListener('click',()=>{
+    const forAmnezia=$('#connection-format').value==='amnezia';
+    const suffix=forAmnezia?'-amnezia'+(amnezia.qr_payloads.length>1?`-${qrIndex+1}-of-${amnezia.qr_payloads.length}`:''):'';
+    if(currentQr)download(stem+suffix+'.svg',currentQr,'image/svg+xml;charset=utf-8');
+  });
+  renderExport();
+}
 async function executePlan(data,confirmation){
   const executionMode=state.mode;
   const button=$('#plan-execute');if(button){button.disabled=true;button.innerHTML=`${icon('clock')} Выполнение…`;}
   try{
     const result=await api('actions/execute',{method:'POST',body:{plan_id:data.plan_id,confirmation}});
-    const config=result.config;
-    let qrSvg='',qrError='';
-    if(config){
-      try{qrSvg=connectionQrSvg(config);}
-      catch(e){qrError=notice(e instanceof RangeError?e.message:'Не удалось сформировать QR-код. Скачайте конфигурацию .conf.','error');}
-    }
-    const connection=config?`${notice('Сохраните конфигурацию сейчас. Файл и QR-код содержат приватный ключ подключения и доступны только до закрытия этого окна.')}${qrSvg?`<section class="connection-qr" aria-labelledby="connection-qr-title"><h3 id="connection-qr-title">Подключение по QR-коду</h3><div class="connection-qr-image" role="img" aria-label="QR-код подключения AmneziaWG">${qrSvg}</div><p class="small-note">В приложении AmneziaWG нажмите + → Сканировать QR-код. Версия клиента должна поддерживать параметры вашего туннеля.</p></section>`:qrError}<div class="subsection-title">КОНФИГУРАЦИЯ ПОДКЛЮЧЕНИЯ</div><pre class="code-block" id="new-client-config">${escape(config)}</pre>`:'';
-    const exports=config?`<button class="button" id="new-config-copy">${icon('copy')} Скопировать</button>${qrSvg?`<button class="button" id="new-qr-download">${icon('download')} Скачать QR</button>`:''}<button class="button button-primary" id="new-config-download">${icon('download')} Скачать .conf</button>`:'';
-    modal(executionMode==='demo'?'Операция симулирована':'Операция завершена','',`<div class="plan-summary">${escape(result.message||result.summary||'Команда обработана. Обновляем состояние сервера.')}</div>${result.output?`<pre class="code-block">${escape(result.output)}</pre>`:''}${connection}`,`${exports}<button class="button" data-close>${icon('check')} Готово</button>`);
-    if(config){
-      const filename=result.filename||'awg-client.conf';
-      $('#new-config-copy').addEventListener('click',()=>copy(config));
-      $('#new-config-download').addEventListener('click',()=>download(filename,config,'text/plain;charset=utf-8'));
-      if(qrSvg)$('#new-qr-download').addEventListener('click',()=>download(filename.replace(/\.conf$/i,'')+'.svg',qrSvg,'image/svg+xml;charset=utf-8'));
-    }
+    showOperationResult(result,executionMode);
     refresh(true);loadAudit(false);
   }catch(e){toast(e.message,true);if(button){button.disabled=true;button.textContent='План использован — подготовьте новый';}}
 }

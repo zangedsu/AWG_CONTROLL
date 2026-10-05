@@ -12,3 +12,5 @@
 .connection-qr-image{width:min(100%,370px);margin:0 auto;background:#fff}
 .connection-qr-image svg{display:block;width:100%;height:auto;shape-rendering:crispEdges}
 .connection-qr .small-note{max-width:400px;margin:14px auto;line-height:1.8}
+.connection-qr-paging{display:flex;justify-content:center;align-items:center;gap:16px;margin:14px 0;font-size:11px;color:var(--subtle)}
+.connection-qr-paging .button{min-width:36px;justify-content:center}
