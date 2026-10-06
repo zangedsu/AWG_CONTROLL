@@ -14,3 +14,7 @@
 .connection-qr .small-note{max-width:400px;margin:14px auto;line-height:1.8}
 .connection-qr-paging{display:flex;justify-content:center;align-items:center;gap:16px;margin:14px 0;font-size:11px;color:var(--subtle)}
 .connection-qr-paging .button{min-width:36px;justify-content:center}
+.client-options{margin-top:20px;border-top:1px solid var(--line);padding-top:16px}
+.client-options summary{cursor:pointer;font-size:11px;color:var(--subtle)}
+.client-options .form-grid{margin-top:18px}
+#client-create-status:empty{display:none}
