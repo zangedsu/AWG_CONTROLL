@@ -2,25 +2,22 @@
 """Bounded, allowlisted SSH bridge. JSON on stdin/stdout; no external Python packages.
 
 SSH authentication is local, the collector is streamed to python3's stdin. Neither
-credentials nor VPN private keys are placed in process arguments. The supplied
-production server is permanently read-only, independent of the UI settings.
+credentials nor VPN private keys are placed in process arguments. Every profile
+is read-only until its local setting explicitly enables management.
 """
 import base64
 import hashlib
-import ipaddress
 import json
 import os
 import re
 import selectors
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
-PROTECTED_HOST = '192.0.2.10'
 MAX_INPUT = 128 * 1024
 MAX_OUTPUT = 4 * 1024 * 1024
 OPERATIONS = {'snapshot', 'logs', 'inspect', 'plan', 'execute', 'fingerprint'}
@@ -101,23 +98,6 @@ def validate_server(server):
     return host, username, port
 
 
-def protected_server(server):
-    host, _, port = validate_server(server)
-    if host.lower().rstrip('.') == PROTECTED_HOST:
-        return True
-    try:
-        addresses = {row[4][0] for row in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)}
-        for value in addresses:
-            address = ipaddress.ip_address(value)
-            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
-                address = address.ipv4_mapped
-            if str(address) == PROTECTED_HOST:
-                return True
-        return False
-    except (OSError, ValueError):
-        raise BridgeError('Cannot safely resolve the target before a write.', 'resolve_failed')
-
-
 def fingerprint(server):
     host, _, port = validate_server(server)
     executable = shutil.which('ssh-keyscan')
@@ -168,7 +148,7 @@ def ssh_call(server, operation, params):
         environment.pop(name, None)
     request = {'operation': operation, 'params': params, 'host': host,
                'write_allowed': server.get('read_only', True) is False,
-               'protected': host == PROTECTED_HOST}
+               'protected': False}
     payload = "REQUEST = " + repr(request) + '\n' + REMOTE_SCRIPT
     with tempfile.TemporaryDirectory(prefix='awg-ssh-') as folder:
         if server.get('password'):
@@ -747,7 +727,7 @@ def collect_snapshot():
             'tunnels':tunnels,'clients':clients,'logs':{'sources':discover_logs(containers,services),'preview':redact(preview['stdout']) if preview['ok'] else ''},
             'network':{k:redact(v['stdout']) for k,v in net.items()},
             'network_status':{k:{'available':v['ok'],'error':None if v['ok'] else v['stderr'],'truncated':v['truncated']} for k,v in net.items()},
-            'warnings':WARNINGS,'collector_version':'1.0','protected':REQUEST.get('protected',False)}
+            'warnings':WARNINGS,'collector_version':'1.0','protected':False}
 
 def log_output(params):
     source=str(params.get('source') or 'journal')
@@ -894,7 +874,7 @@ def plan_action(params):
       'service.restart':'Перезапустить службу systemd.', 'service.start':'Запустить службу systemd.',
       'service.stop':'Остановить службу systemd.', 'host.reboot':'Перезагрузить сервер.'}
     if action not in summaries: raise RemoteError('Unknown allowlisted action.')
-    warnings=[];commands=[];target='server';executable=bool(REQUEST.get('write_allowed')) and not REQUEST.get('protected')
+    warnings=[];commands=[];target='server';executable=REQUEST.get('write_allowed') is True
     state={'action':action};extra={}
     if action.startswith('client.'):
         container,iface,path,tool,text,config,peers=selected_tunnel(params)
@@ -954,8 +934,7 @@ def plan_action(params):
         state['machine_id']=readfile('/etc/machine-id').strip()
         state['boot_id']=readfile('/proc/sys/kernel/random/boot_id').strip()
         commands=['systemctl reboot'];warnings=['SSH, VPN и все службы будут временно недоступны.']
-    if REQUEST.get('protected'): warnings.append('Этот реальный сервер навсегда защищён от изменений в приложении.')
-    elif not REQUEST.get('write_allowed'): warnings.append('Для сервера включён режим только чтения.')
+    if REQUEST.get('write_allowed') is not True: warnings.append('Для сервера включён режим только чтения.')
     digest=hashlib.sha256(json.dumps(state,sort_keys=True,separators=(',',':')).encode()).hexdigest()
     return dict({'action':action,'target':target,'summary':summaries[action],'commands':commands,
                  'warnings':warnings,'executable':executable,'precondition':digest},**extra)
@@ -1137,14 +1116,8 @@ def update_compose_container(params):
             'completed_at':now(),'service':compose['service'],'project':compose['project']}
 
 def execute_action(params):
-    if REQUEST.get('protected') or REQUEST.get('host')=='192.0.2.10': raise RemoteError('Protected production server: writes are permanently disabled.')
-    if not REQUEST.get('write_allowed'): raise RemoteError('Read-only server: writes are disabled.')
+    if REQUEST.get('write_allowed') is not True: raise RemoteError('Read-only server: writes are disabled.')
     if params.get('confirmed') is not True: raise RemoteError('A reviewed and confirmed action plan is required.')
-    # Also protect a DNS alias that resolves to this server from inside its own
-    # network. The bridge already performs a separate local DNS guard.
-    ips=run(['ip','-j','address','show'])
-    if any(address.get('local')=='192.0.2.10' for interface in json_value(ips['stdout'],[]) for address in interface.get('addr_info',[])):
-        raise RemoteError('Protected production IP detected on the remote host.')
     plan=plan_action(params)
     expected=params.get('expected_precondition')
     if not isinstance(expected,str) or not re.fullmatch(r'[a-f0-9]{64}',expected):
@@ -1218,8 +1191,6 @@ def main():
         server, params = request.get('server') or {}, request.get('params') or {}
         validate_server(server)
         if operation == 'execute':
-            if protected_server(server):
-                raise BridgeError('Protected production server: writes are permanently disabled.', 'protected_server')
             if server.get('read_only', True) is not False:
                 raise BridgeError('Read-only server: writes are disabled.', 'read_only')
             if params.get('confirmed') is not True:

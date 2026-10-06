@@ -1,8 +1,9 @@
 """Collector fixtures and policy checks. SSH and remote subprocesses are mocked."""
 import base64
+import contextlib
 import importlib.util
+import io
 import json
-import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -232,12 +233,35 @@ class RemoteFixtures(unittest.TestCase):
 
     def test_remote_write_guard_rejects_before_commands(self):
         self.ns["run"] = lambda *args, **kwargs: self.fail("Read-only guard must run before any command")
-        for request in [{"host": "192.0.2.10", "write_allowed": True},
-                        {"host": "198.51.100.42", "protected": True, "write_allowed": True},
-                        {"host": "198.51.100.42", "write_allowed": False}]:
+        self.ns["plan_action"] = lambda *args, **kwargs: self.fail("Read-only guard must run before planning")
+        for request in [{"host": "192.0.2.10"},
+                        {"host": "198.51.100.42", "write_allowed": False},
+                        {"host": "198.51.100.42", "write_allowed": "false"},
+                        {"host": "198.51.100.42", "write_allowed": 1}]:
             self.ns["REQUEST"] = request
             with self.assertRaises(self.ns["RemoteError"]):
                 self.ns["execute_action"]({"action": "host.reboot", "confirmed": True})
+
+    def test_explicit_management_mode_is_independent_of_host_ip_or_legacy_protected_flag(self):
+        digest = "a" * 64
+        self.ns["plan_action"] = lambda params: {"precondition": digest, "executable": True}
+        calls = []
+        self.ns["run"] = lambda args, *rest, **kwargs: (calls.append(args) or result())
+        for host in ("192.0.2.10", "alias.example", "::ffff:192.0.2.10"):
+            self.ns["REQUEST"] = {"host": host, "write_allowed": True, "protected": True}
+            completed = self.ns["execute_action"]({"action": "container.restart", "container": "fixture-container",
+                                                   "confirmed": True, "expected_precondition": digest})
+            self.assertEqual(completed["action"], "container.restart")
+        self.assertEqual(calls, [["docker", "restart", "fixture-container"]] * 3)
+
+    def test_plan_management_mode_does_not_use_ip_or_protected_metadata(self):
+        self.ns["REQUEST"] = {"host": "192.0.2.10", "write_allowed": True, "protected": True}
+        self.ns["readfile"] = lambda *args, **kwargs: "fixture"
+        planned = self.ns["plan_action"]({"action": "host.reboot"})
+        self.assertTrue(planned["executable"])
+        self.assertFalse(any("навсегда" in warning for warning in planned["warnings"]))
+        self.ns["REQUEST"]["write_allowed"] = False
+        self.assertFalse(self.ns["plan_action"]({"action": "host.reboot"})["executable"])
 
     def mutation_fixture(self, config_text=CONFIG):
         config, peers = self.ns["parse_config"](config_text)
@@ -505,16 +529,40 @@ class RemoteFixtures(unittest.TestCase):
 
 
 class BridgePolicyTests(unittest.TestCase):
-    def test_protected_address_and_dns_aliases_including_mapped_ipv6(self):
-        base = {"username": "root", "port": 22, "read_only": False}
-        self.assertTrue(bridge.protected_server(dict(base, host="192.0.2.10")))
-        for address in ["192.0.2.10", "::ffff:192.0.2.10"]:
-            row = (socket.AF_INET6 if ":" in address else socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 22))
-            with mock.patch.object(bridge.socket, "getaddrinfo", return_value=[row]):
-                self.assertTrue(bridge.protected_server(dict(base, host="alias.example")), address)
-        with mock.patch.object(bridge.socket, "getaddrinfo", side_effect=socket.gaierror()):
-            with self.assertRaises(bridge.BridgeError):
-                bridge.protected_server(dict(base, host="unresolvable.example"))
+    def invoke_bridge(self, server, params=None):
+        request = {"operation": "execute", "server": server,
+                   "params": params if params is not None else {"action": "container.restart", "confirmed": True}}
+        output = io.StringIO()
+        stdin = mock.Mock(buffer=io.BytesIO(json.dumps(request).encode()))
+        with mock.patch.object(bridge.sys, "stdin", stdin), contextlib.redirect_stdout(output), \
+                mock.patch.object(bridge, "ssh_call", return_value={"ok": True, "data": {"mocked": True}}) as ssh:
+            bridge.main()
+        return json.loads(output.getvalue()), ssh
+
+    def test_missing_and_explicit_read_only_block_before_ssh(self):
+        base = {"host": "192.0.2.10", "username": "root", "port": 22}
+        candidates = [base] + [dict(base, read_only=value) for value in (True, None, 0, 1, "false")]
+        for server in candidates:
+            with self.subTest(server=server):
+                response, ssh = self.invoke_bridge(server)
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["code"], "read_only")
+                ssh.assert_not_called()
+
+    def test_explicit_false_management_opt_in_is_not_filtered_by_ip_or_alias(self):
+        for host in ("192.0.2.10", "alias.example", "::ffff:192.0.2.10"):
+            with self.subTest(host=host):
+                server = {"host": host, "username": "root", "port": 22, "read_only": False, "protected": True}
+                response, ssh = self.invoke_bridge(server)
+                self.assertTrue(response["ok"])
+                ssh.assert_called_once_with(server, "execute", {"action": "container.restart", "confirmed": True})
+
+    def test_management_opt_in_still_requires_operation_confirmation(self):
+        response, ssh = self.invoke_bridge({"host": "192.0.2.10", "username": "root", "read_only": False},
+                                          {"action": "container.restart"})
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["code"], "confirmation_required")
+        ssh.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -10,7 +10,6 @@ final class ApiError extends RuntimeException
 
 final class App
 {
-    public const PROTECTED_HOST = '192.0.2.10';
     public Store $store;
     private string $root;
 
@@ -32,7 +31,7 @@ final class App
     public function publicServer(array $server): array
     {
         return ['id' => $server['id'], 'name' => $server['name'], 'host' => $server['host'], 'port' => $server['port'], 'username' => $server['username'],
-            'read_only' => $this->isReadOnly($server), 'protected' => $server['host'] === self::PROTECTED_HOST,
+            'read_only' => $this->isReadOnly($server), 'protected' => false,
             'auth_type' => empty($server['key_path']) ? 'password' : 'key', 'key_path' => $server['key_path'] ?? '',
             'has_password' => !empty($server['password_encrypted']), 'pinned' => !empty($server['fingerprint']), 'fingerprint' => $server['fingerprint'] ?? null];
     }
@@ -46,7 +45,7 @@ final class App
 
     public function isReadOnly(array $server): bool
     {
-        return $server['host'] === self::PROTECTED_HOST || ($server['read_only'] ?? true) !== false;
+        return ($server['read_only'] ?? true) !== false;
     }
 
     public function saveServer(array $input): array
@@ -64,7 +63,8 @@ final class App
         $name = trim((string) ($input['name'] ?? $old['name'] ?? $host));
         if (!$name || mb_strlen($name) > 80) throw new ApiError('invalid_name', 'Имя сервера: от 1 до 80 символов.');
         $server = ['id' => $id, 'name' => $name, 'host' => $host, 'port' => $port, 'username' => $username,
-            'read_only' => $host === self::PROTECTED_HOST || ($input['read_only'] ?? $old['read_only'] ?? true) !== false,
+            'read_only' => ($input['read_only'] ?? $old['read_only'] ?? true) !== false,
+            'revision' => (int) ($old['revision'] ?? 0) + 1,
             'key_path' => (string) ($input['key_path'] ?? $old['key_path'] ?? ''), 'fingerprint' => $old['fingerprint'] ?? null,
             'known_hosts_path' => $this->store->path('known_hosts.' . $id), 'password_encrypted' => $old['password_encrypted'] ?? null];
         if (!empty($input['password'])) $server['password_encrypted'] = $this->store->encrypt((string) $input['password']);
@@ -134,12 +134,12 @@ final class App
         $server = $this->server($id);
         if (empty($server['fingerprint'])) throw new ApiError('host_key_required', 'Подтвердите SSH-отпечаток сервера в настройках.', 409);
         $cache = $this->store->read('snapshot.' . $id, null);
-        if (!$force && $cache && time() - $cache['cached_at'] < 4) return $cache['data'];
+        if (!$force && $cache && time() - $cache['cached_at'] < 4) return array_replace($cache['data'], ['server' => $this->publicServer($server), 'protected' => false]);
         $lock = fopen($this->store->path('snapshot.' . $id . '.lock'), 'c'); chmod($this->store->path('snapshot.' . $id . '.lock'), 0600);
         flock($lock, LOCK_EX);
         try {
             $cache = $this->store->read('snapshot.' . $id, null);
-            if (!$force && $cache && time() - $cache['cached_at'] < 4) return $cache['data'];
+            if (!$force && $cache && time() - $cache['cached_at'] < 4) return array_replace($cache['data'], ['server' => $this->publicServer($server), 'protected' => false]);
             $data = $this->engine('snapshot', $server);
             $data['server'] = $this->publicServer($server);
             foreach ($data['clients'] ?? [] as $index => $client) {
@@ -206,7 +206,7 @@ final class App
         $readOnly = $mode === 'demo' || $this->isReadOnly($server);
         $plan = array_merge($plan, ['plan_id' => bin2hex(random_bytes(16)), 'action' => $action, 'target' => $target, 'read_only' => $readOnly,
             'executable' => !$readOnly && ($plan['executable'] ?? false), 'expires_at' => gmdate('c', time() + 600)]);
-        if ($readOnly) $plan['warnings'][] = 'Режим «только чтение»: выполнение изменений заблокировано серверной политикой.';
+        if ($readOnly) $plan['warnings'][] = 'Режим «только чтение»: выполнение изменений заблокировано настройкой профиля сервера.';
         if (!empty($plan['precondition'])) $params['expected_precondition'] = $plan['precondition'];
         $stored = ['public' => $plan, 'params' => $params, 'server_id' => $id, 'mode' => $mode, 'expires' => time() + 600,
             'server_hash' => hash('sha256', json_encode($server)), 'session' => hash('sha256', session_id())];
@@ -226,7 +226,7 @@ final class App
             if ($plan['expires'] < time() || !empty($plan['consumed'])) throw new ApiError('plan_expired', 'План истёк или уже использован.', 409);
             if ($plan['mode'] === 'demo' || !$plan['public']['executable']) throw new ApiError('read_only', 'Выполнение заблокировано: сервер доступен только для чтения.', 403);
             $server = $this->server($plan['server_id']);
-            if ($this->isReadOnly($server)) throw new ApiError('read_only', 'Изменения сервера запрещены политикой.', 403);
+            if ($this->isReadOnly($server)) throw new ApiError('read_only', 'В профиле сервера включён режим «только чтение».', 403);
             if (!hash_equals($plan['server_hash'], hash('sha256', json_encode($server)))) throw new ApiError('server_changed', 'Настройки подключения изменились. Создайте новый план.', 409);
             if (!hash_equals($plan['public']['target'], (string) ($input['confirmation'] ?? ''))) throw new ApiError('confirmation_required', 'Для подтверждения введите имя цели из плана.');
             $plan['consumed'] = true; $this->store->write('plan.' . $id, $plan);
